@@ -1,0 +1,200 @@
+/**
+ * 缓存管理模块
+ * 集中管理所有内存缓存，包括：
+ * - 服务器列表缓存
+ * - 服务器详情（复用服务器列表缓存）
+ * - 最新指标缓存
+ * - 历史指标缓存
+ * - 站点设置缓存
+ */
+
+import { clearAppearanceSettingsCache, clearSiteSettingsCache, debug } from './settings.js';
+import { SERVER_DETAIL_CACHE_MAX_ENTRIES, METRICS_HISTORY_CACHE_MAX_ENTRIES } from './config.js';
+
+const SERVERS_LIST_TTL = 120 * 1000;
+let serversListCache = null;
+
+const LATEST_ALL_TTL = 30 * 1000;
+let latestAllCache = null;
+let latestAllCacheTime = 0;
+
+const metricsHistoryCache = new Map();
+
+const serverDetailCache = new Map();
+
+// 超限时按写入顺序淘汰，避免额外定时任务。
+function setCacheEntry(cache, key, entry, maxEntries) {
+  cache.delete(key);
+  cache.set(key, entry);
+  while (cache.size > maxEntries) {
+    cache.delete(cache.keys().next().value);
+  }
+}
+
+export function getCacheDuration(hours) {
+  if (hours >= 48) {
+    return 20 * 60 * 1000;
+  }else if (hours >= 24) {
+    return 15 * 60 * 1000;
+  }else if (hours >= 12) {
+    return 10 * 60 * 1000;
+  } else if (hours >= 6) {
+    return 5 * 60 * 1000;
+  } else if (hours >= 1) {
+    return 2 * 60 * 1000;
+  } else {
+    return 1 * 60 * 1000;
+  }
+}
+
+function filterServersByHidden(servers, includeHidden) {
+  if (!servers || servers.length === 0) return [];
+  if (includeHidden) {
+    return [...servers];
+  }
+  return servers.filter(s => s.is_hidden !== 1 && s.is_hidden !== '1');
+}
+
+export async function getAllServers(db, includeHidden = true) {
+  const now = Date.now();
+  
+  if (serversListCache && now - serversListCache.time < SERVERS_LIST_TTL) {
+    debug('服务器列表缓存命中');
+    return filterServersByHidden(serversListCache.data, includeHidden);
+  }
+
+  try {
+    const { results } = await db.prepare('SELECT * FROM servers ORDER BY sort_order ASC').all();
+    serversListCache = { data: results, time: now };
+    debug('服务器列表缓存更新');
+    return filterServersByHidden(results, includeHidden);
+  } catch (e) {
+    debug('获取服务器列表失败:', e);
+    return filterServersByHidden(serversListCache?.data, includeHidden);
+  }
+}
+
+export function clearServersListCache() {
+  serversListCache = null;
+  serverDetailCache.clear();
+}
+
+export function clearServerDetailCache() {
+  serverDetailCache.clear();
+}
+
+// 按 id 就地打补丁更新已缓存的服务器详情字段（不创建条目、不清全表）
+// 用于运行时状态列（如 traffic_alert_state）写回后刷新缓存，避免 TTL 内读到旧值重复触发。
+export function patchServerDetailCache(id, fields) {
+  const entry = serverDetailCache.get(id);
+  if (entry && entry.data) Object.assign(entry.data, fields);
+}
+
+export async function getServerDetail(db, id, includeHidden = false) {
+  const now = Date.now();
+  const cached = serverDetailCache.get(id);
+  
+  if (cached) {
+    if (now - cached.time < SERVERS_LIST_TTL) {
+      debug('服务器详情缓存命中');
+      const server = cached.data;
+      
+      if (!server) {
+        return null;
+      }
+      
+      if (!includeHidden && (server.is_hidden === 1 || server.is_hidden === '1')) {
+        return null;
+      }
+      
+      return { ...server };
+    }
+    
+    // 过期详情保留为 D1 异常时的兜底值，直到成功刷新、主动清理或容量淘汰。
+  }
+  
+  let server;
+  let degraded = false;
+  try {
+    server = await db.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
+  } catch (e) {
+    // 与 getAllServers 一致：D1 异常时回退上一次已知结果，不把基础设施抖动放大成业务失败。
+    if (!cached) throw e;
+    debug('服务器详情查询失败，回退缓存值:', e);
+    server = cached.data;
+    degraded = true;
+  }
+
+  if (!degraded) {
+    setCacheEntry(serverDetailCache, id, {
+      data: server,
+      time: now
+    }, SERVER_DETAIL_CACHE_MAX_ENTRIES);
+    debug('服务器详情缓存更新');
+  }
+  
+  if (!server) {
+    return null;
+  }
+  
+  if (!includeHidden && (server.is_hidden === 1 || server.is_hidden === '1')) {
+    return null;
+  }
+  
+  return { ...server };
+}
+
+/**
+ * 获取最新指标缓存信息
+ * @returns {object} 包含 cache、time、ttl 字段的对象
+ */
+export function getLatestMetricsCache() {
+  return { cache: latestAllCache, time: latestAllCacheTime, ttl: LATEST_ALL_TTL };
+}
+
+export function setLatestMetricsCache(data) {
+  latestAllCache = data;
+  latestAllCacheTime = Date.now();
+}
+
+export function clearLatestMetricsCache() {
+  latestAllCache = null;
+  latestAllCacheTime = 0;
+}
+
+function getCacheKey(serverId, hours, columns, samplePoints = null) {
+  const sortedColumns = columns.split(',').sort().join(',');
+  const sampleSuffix = samplePoints ? `:points=${samplePoints}` : '';
+  return `${serverId}:${hours}:${sortedColumns}${sampleSuffix}`;
+}
+
+export function getMetricsHistoryCache(serverId, hours, columns, samplePoints = null) {
+  const key = getCacheKey(serverId, hours, columns, samplePoints);
+  const cached = metricsHistoryCache.get(key);
+  if (cached && Date.now() >= cached.expiresAt) {
+    metricsHistoryCache.delete(key);
+    return undefined;
+  }
+  return cached;
+}
+
+export function setMetricsHistoryCache(serverId, hours, columns, data, samplePoints = null) {
+  const key = getCacheKey(serverId, hours, columns, samplePoints);
+  const now = Date.now();
+  for (const [cachedKey, cached] of metricsHistoryCache) {
+    if (now >= cached.expiresAt) metricsHistoryCache.delete(cachedKey);
+  }
+  setCacheEntry(metricsHistoryCache, key, {
+    data,
+    timestamp: now,
+    expiresAt: now + getCacheDuration(hours)
+  }, METRICS_HISTORY_CACHE_MAX_ENTRIES);
+}
+
+export function clearAllCaches() {
+  clearServersListCache();
+  clearLatestMetricsCache();
+  metricsHistoryCache.clear();
+  clearSiteSettingsCache();
+  clearAppearanceSettingsCache();
+}
